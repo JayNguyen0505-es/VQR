@@ -1,7 +1,7 @@
 import numpy as np
 
 from env import Environment, Officers, Events
-
+from tqdm import tqdm
 
 def random_algorithm(env, num_episodes=100):
     """
@@ -15,7 +15,7 @@ def random_algorithm(env, num_episodes=100):
         List of rewards for each episode.
     """
     rewards = []
-    for episode in range(num_episodes):
+    for episode in tqdm(range(num_episodes)):
         env.reset()
         done = False
         total_reward = 0
@@ -37,20 +37,20 @@ def random_algorithm(env, num_episodes=100):
             done = True
 
         rewards.append(total_reward)
-        print(f"Episode {episode + 1}/{num_episodes}: Reward = {total_reward}")
+        # print(f"Episode {episode + 1}/{num_episodes}: Reward = {total_reward}")
 
     return rewards
 
 
 # Example usage
 if __name__ == "__main__":
-    NUM_OFFICERS = 5
-    NUM_EVENTS = 4
-    NUM_TASKS = 4
+    NUM_OFFICERS = 4
+    NUM_EVENTS = 3
+    NUM_TASKS = 2
     EPISODES = 50000
 
     env = Environment(Officers(NUM_OFFICERS, NUM_EVENTS, NUM_TASKS), Events(NUM_EVENTS, NUM_TASKS))
     random_rewards = random_algorithm(env, num_episodes=EPISODES)
-    avg_rewards = [np.mean(random_rewards[i:i + 100]) for i in range(0, len(random_rewards), 100)]
-    print("Average reward per 100 episodes:", avg_rewards)
+    avg_rewards = [np.mean(random_rewards[i:i + 1000]) for i in range(0, len(random_rewards), 1000)]
+    print("Average reward per 1000 episodes:", avg_rewards)
     print("Average Reward over Random Algorithm:", np.mean(random_rewards))
