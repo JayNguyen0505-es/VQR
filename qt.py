@@ -2,19 +2,12 @@ import tensorflow as tf
 import tensorflow_quantum as tfq
 import cirq
 import sympy
-import json
 import numpy as np
-import os
-import datetime
-from tensorflow.keras import layers
-from cirq.contrib.svg import SVGCircuit
-from abc import ABC, abstractmethod
-from matplotlib import pyplot as plt
 from tensorflow import keras
+from keras import layers
+from cirq.contrib.svg import SVGCircuit
 import logging
 from env import Environment, Officers, Events
-
-logging.getLogger('matplotlib.font_manager').disabled = True
 
 
 # ---------------------------------------------------------------------------------
@@ -34,9 +27,8 @@ class Memory_Prioritized:
 
         self.priorities = np.zeros(capacity, dtype=float)
 
-        self.start_learning = 5000
-        self.batch_size = 128
-        self.train_iteration = 1000
+        self.start_learning = 1000
+        self.batch_size = 1024
 
         self.insert_at = 0
         self.size = 0
@@ -60,10 +52,10 @@ class Memory_Prioritized:
         if self.size == self.capacity:
             priorities = self.priorities
         else:
-            priorities = self.priorities[:self.size]
+            priorities = self.priorities[: self.size]
 
-        scaled_priorities = priorities ** self.alpha
-        sample_prob = scaled_priorities / scaled_priorities.sum()
+        scaled_priorities = priorities**self.alpha
+        sample_prob = scaled_priorities / np.sum(scaled_priorities)
 
         indices = np.random.choice(self.size, batch_size, p=sample_prob)
         states = self.states[indices]
@@ -147,49 +139,75 @@ class NStepBuffer:
 
 
 # ---------------------------------------------------------------------------------
-# NOISY DENSE (optional for Rainbow)
+# NOISY DENSE LAYER
 # ---------------------------------------------------------------------------------
 class NoisyDense(layers.Layer):
-    def __init__(self, units, activation=None, **kwargs):
+    def __init__(
+        self,
+        units,
+        activation=None,
+        kernel_initializer=None,
+        kernel_regularizer=None,
+        bias_initializer=None,
+        bias_regularizer=None,
+        **kwargs,
+    ):
         super(NoisyDense, self).__init__(**kwargs)
         self.units = units
         self.activation = keras.activations.get(activation)
+        self.kernel_initializer = kernel_initializer
+        self.kernel_regularizer = kernel_regularizer
+        self.bias_initializer = bias_initializer
+        self.bias_regularizer = bias_regularizer
 
     def build(self, input_shape):
         input_dim = int(input_shape[-1])
         limit = 1 / np.sqrt(input_dim)
 
-        self.w_mu = self.add_weight(
-            name='w_mu',
-            shape=(input_dim, self.units),
-            initializer=tf.keras.initializers.RandomUniform(-limit, limit),
-            trainable=True
+        kernel_init = (
+            self.kernel_initializer
+            if self.kernel_initializer is not None
+            else tf.keras.initializers.RandomUniform(minval=-limit, maxval=limit)
         )
-        self.w_sigma = self.add_weight(
-            name='w_sigma',
-            shape=(input_dim, self.units),
-            initializer=tf.keras.initializers.Constant(0.017),
-            trainable=True
+        bias_init = (
+            self.bias_initializer
+            if self.bias_initializer is not None
+            else tf.keras.initializers.RandomUniform(minval=-limit, maxval=limit)
         )
 
+        self.w_mu = self.add_weight(
+            name="w_mu",
+            shape=(input_dim, self.units),
+            initializer=kernel_init,
+            regularizer=self.kernel_regularizer,
+            trainable=True,
+        )
+        self.w_sigma = self.add_weight(
+            name="w_sigma",
+            shape=(input_dim, self.units),
+            initializer=tf.keras.initializers.Constant(0.017),
+            trainable=True,
+        )
         self.b_mu = self.add_weight(
-            name='b_mu',
+            name="b_mu",
             shape=(self.units,),
-            initializer=tf.keras.initializers.RandomUniform(-limit, limit),
-            trainable=True
+            initializer=bias_init,
+            regularizer=self.bias_regularizer,
+            trainable=True,
         )
         self.b_sigma = self.add_weight(
-            name='b_sigma',
+            name="b_sigma",
             shape=(self.units,),
             initializer=tf.keras.initializers.Constant(0.017),
-            trainable=True
+            trainable=True,
         )
         super().build(input_shape)
 
     def call(self, inputs):
+        # Generate noise for weights and biases.
         epsilon_w = tf.random.normal(shape=(inputs.shape[-1], self.units))
         epsilon_b = tf.random.normal(shape=(self.units,))
-
+        # Compute noisy weights and biases.
         w = self.w_mu + self.w_sigma * epsilon_w
         b = self.b_mu + self.b_sigma * epsilon_b
 
@@ -205,11 +223,9 @@ class NoisyDense(layers.Layer):
 def create_distributional_head(inputs, num_actions, num_atoms):
     """
     Returns a Tensor of shape (batch_size, num_actions, num_atoms).
-    We'll apply a final softmax to get the probability distribution over the atoms.
     """
-    # You can insert more layers if you like. For simplicity:
-    x = NoisyDense(256, activation='relu')(inputs)
-    x = NoisyDense(num_actions * num_atoms)(x)  # shape (batch_size, num_actions * num_atoms)
+    x = NoisyDense(512, activation="relu")(inputs)
+    x = NoisyDense(num_actions * num_atoms)(x)
     x = layers.Reshape((num_actions, num_atoms))(x)
     dist = layers.Softmax(axis=-1)(x)
     return dist
@@ -226,13 +242,13 @@ def create_dueling_distributional_head(inputs, num_actions, num_atoms):
     Then combine them into final distribution (batch, num_actions, num_atoms).
     """
     # Value stream
-    val = NoisyDense(128, activation='relu')(inputs)
+    val = NoisyDense(128, activation="relu")(inputs)
     val = NoisyDense(num_atoms)(val)  # shape (batch, num_atoms)
     val = layers.Reshape((1, num_atoms))(val)  # shape (batch, 1, num_atoms)
 
     # Advantage stream
-    adv = NoisyDense(128, activation='relu')(inputs)
-    adv = NoisyDense(num_actions * num_atoms)(adv)  # shape (batch, num_actions * num_atoms)
+    adv = NoisyDense(128, activation="relu")(inputs)
+    adv = NoisyDense(num_actions * num_atoms)(adv)
     adv = layers.Reshape((num_actions, num_atoms))(adv)
 
     # Then combine: Q(a) = V + (Adv(a) - mean(Adv(a)))
@@ -246,7 +262,7 @@ def create_dueling_distributional_head(inputs, num_actions, num_atoms):
 
 
 # ---------------------------------------------------------------------------------
-# QUANTUM LAYER (from your snippet)
+# QUANTUM LAYER
 # ---------------------------------------------------------------------------------
 class QuantumLayer(tf.keras.layers.Layer):
     def __init__(self, n_qubits, n_layers, **kwargs):
@@ -255,7 +271,7 @@ class QuantumLayer(tf.keras.layers.Layer):
         self.n_layers = n_layers
         # Here we assume a linear array or 1D grid of qubits
         self.qubits = cirq.GridQubit.rect(1, self.n_qubits)
-        self.symbols = sympy.symbols(f'theta0:{2 * n_qubits * n_layers}')
+        self.symbols = sympy.symbols(f"theta0:{2 * n_qubits * n_layers}")
         self.circuit = self.build_circuit()
         self.circuit_tensor = tfq.convert_to_tensor([self.circuit])
         self.readout_ops = [cirq.Z(q) for q in self.qubits]
@@ -284,14 +300,16 @@ class QuantumLayer(tf.keras.layers.Layer):
 
         # inputs is shaped (batch_size, 2*n_qubits*n_layers)
         # We pass these values in as symbol_values for parameterized gates
-        symbol_values = tf.reshape(inputs, (batch_size, 2 * self.n_qubits * self.n_layers))
+        symbol_values = tf.reshape(
+            inputs, (batch_size, 2 * self.n_qubits * self.n_layers)
+        )
 
         # Expectation of Z on each qubit
         return self.expectation_layer(
             tiled_circuits,
             symbol_names=[str(s) for s in self.symbols],
             symbol_values=symbol_values,
-            operators=self.readout_ops
+            operators=self.readout_ops,
         )
 
     def visualize_circuit(self):
@@ -299,20 +317,24 @@ class QuantumLayer(tf.keras.layers.Layer):
 
     def get_config(self):
         config = super().get_config().copy()
-        config.update({
-            'n_qubits': self.n_qubits,
-            'n_layers': self.n_layers,
-        })
+        config.update(
+            {
+                "n_qubits": self.n_qubits,
+                "n_layers": self.n_layers,
+            }
+        )
         return config
 
     def get_circuit_info(self):
         return {
-            'number_of_qubits': self.n_qubits,
-            'number_of_layers': self.n_layers,
-            'number_of_parameters': len(self.symbols),
-            'circuit_depth': len(self.circuit),
-            'circuit_moments': len(list(self.circuit.moments)),
-            'operation_types': set(op.gate.__class__.__name__ for op in self.circuit.all_operations())
+            "number_of_qubits": self.n_qubits,
+            "number_of_layers": self.n_layers,
+            "number_of_parameters": len(self.symbols),
+            "circuit_depth": len(self.circuit),
+            "circuit_moments": len(list(self.circuit.moments)),
+            "operation_types": set(
+                op.gate.__class__.__name__ for op in self.circuit.all_operations()
+            ),
         }
 
 
@@ -321,37 +343,35 @@ class QuantumLayer(tf.keras.layers.Layer):
 # ---------------------------------------------------------------------------------
 class RainbowDQN:
     def __init__(
-            self,
-            officers,
-            events,
-            gamma=0.99,
-            lr=1e-4,
-            num_atoms=51,
-            v_min=-100.0,
-            v_max=0.0,
-            n_step=3,
-            alpha=0.6,
-            beta_start=0.4,
-            beta_frames=100000,
-            epsilon=1.0,
-            eps_decay=0.998,
-            epsilon_min=0.05,
-            update_target_interval=1000,
-            use_dueling=True,
-            # New quantum parameters
-            n_qubits=16,
-            n_layers_q=3
+        self,
+        officers,
+        events,
+        gamma=0.99,
+        lr=1e-4,
+        num_atoms=51,
+        v_min=-1.0,
+        v_max=0.0,
+        n_step=3,
+        alpha=0.6,
+        beta_start=0.4,
+        beta_frames=100000,
+        epsilon=1.0,
+        eps_decay=0.998,
+        epsilon_min=0.05,
+        update_target_interval=1000,
+        use_dueling=True,
+        n_qubits=16,
+        n_layers_q=3,
     ):
         self.officers = officers
         self.events = events
         self.env = Environment(officers, events)
 
-        # The rest of your environment and parameter setups...
         self.state_size = (
-                officers.num_officer * events.num_task * events.num_event
-                + events.occurence.size
-                + events.transition_matrix.size
-                + events.num_task * events.num_event  # For action_table
+            officers.num_officer * events.num_task * events.num_event
+            + events.occurence.size
+            + events.transition_matrix.size
+            + events.num_task * events.num_event
         )
 
         self.num_actions = officers.num_officer
@@ -359,7 +379,9 @@ class RainbowDQN:
         self.num_atoms = num_atoms
         self.v_min = v_min
         self.v_max = v_max
-        self.atoms = tf.cast(tf.linspace(self.v_min, self.v_max, self.num_atoms), dtype=tf.float32)
+        self.atoms = tf.cast(
+            tf.linspace(self.v_min, self.v_max, self.num_atoms), dtype=tf.float32
+        )
 
         self.n_step = n_step
         self.nstep_buffer = NStepBuffer(n_step, gamma)
@@ -368,7 +390,9 @@ class RainbowDQN:
         self.eps_decay = eps_decay
         self.epsilon_min = epsilon_min
 
-        self.memory = Memory_Prioritized(capacity=100000, state_size=self.state_size, alpha=alpha)
+        self.memory = Memory_Prioritized(
+            capacity=100000, state_size=self.state_size, alpha=alpha
+        )
         self.beta = beta_start
         self.beta_increment = (1.0 - beta_start) / beta_frames
 
@@ -387,8 +411,10 @@ class RainbowDQN:
         self.losses = []
 
         self.max_time = (
-                np.max(np.array(officers.capability)) * events.num_task * events.num_event
-                + np.max(np.array(events.transition_matrix)) * events.num_task * events.num_event
+            np.max(np.array(officers.capability)) * events.num_task * events.num_event
+            + np.max(np.array(events.transition_matrix))
+            * events.num_task
+            * events.num_event
         )
 
     # ----------------------------------------------------------------
@@ -402,42 +428,37 @@ class RainbowDQN:
           - A quantum circuit (parameterized by n_qubits, n_layers_q)
           - Then final classical layers / dueling distributional head
         """
-        inputs = layers.Input(shape=(self.state_size,), name='state_input')
+        inputs = layers.Input(shape=(self.state_size,), name="state_input")
 
-        # Classical front-end
-        x = NoisyDense(256, activation='relu')(inputs)
-        x = NoisyDense(256, activation='relu')(x)
+        x = NoisyDense(256, activation="relu")(inputs)
+        x = NoisyDense(256, activation="relu")(x)
 
-        # Create enough parameters for our quantum circuit
-        # We scale the output so it's in [-1, +1] or something suitable
+        # Quantum circuit
         encode = layers.Dense(
-            2 * self.n_qubits * self.n_layers_q,
-            activation='tanh',
-            name='encoding'
+            2 * self.n_qubits * self.n_layers_q, activation="tanh", name="encoding"
         )(x)
 
         # Quantum processing
-        q_out = QuantumLayer(self.n_qubits, self.n_layers_q, name='quantum_layer')(encode)
+        q_out = QuantumLayer(self.n_qubits, self.n_layers_q, name="quantum_layer")(
+            encode
+        )
 
         # Merge classical + quantum
-        # Typically you'd want to flatten or reduce the quantum output if it has shape (batch, n_qubits).
-        # But in this case, each qubit's expectation is 1 value, so q_out is shape (batch, n_qubits).
-        # We can directly concatenate them:
-        merged = layers.Concatenate(name='merged_classical_quantum')([x, q_out])
+        merged = layers.Concatenate(name="merged_classical_quantum")([x, q_out])
 
-        # Possibly more classical layers after merging
-        post = NoisyDense(256, activation='relu', name='post_merge_dense')(merged)
+        post = NoisyDense(256, activation="relu", name="post_merge_dense")(merged)
 
-        # Choose distributional head (dueling or standard)
         if use_dueling:
-            dist = create_dueling_distributional_head(post, self.num_actions, self.num_atoms)
+            dist = create_dueling_distributional_head(
+                post, self.num_actions, self.num_atoms
+            )
         else:
             dist = create_distributional_head(post, self.num_actions, self.num_atoms)
 
         model = keras.Model(inputs=inputs, outputs=dist, name="RainbowDQN_Quantum")
         model.compile(
-            optimizer=keras.optimizers.Adam(lr),
-            loss='categorical_crossentropy'
+            optimizer=keras.optimizers.Adam(lr, clipnorm=1.0),
+            loss="categorical_crossentropy",
         )
         return model
 
@@ -452,50 +473,99 @@ class RainbowDQN:
     def play_one_episode_step_by_step(self, obs):
         num_tasks = self.events.num_task * self.events.num_event
         action_table = np.full(num_tasks, -1, dtype=int)
-        episode_memory = []
+
+        old_makespan = 0.0  # Initial makespan
+        partial_assignment = []
 
         for i in range(num_tasks):
             current_state = np.concatenate([obs, action_table])
+
+            # Epsilon-greedy action selection
             if np.random.rand() < self.epsilon:
                 action_id = np.random.randint(0, self.num_actions)
             else:
-                state_tf = tf.convert_to_tensor(current_state[None, :], dtype=tf.float32)
+                state_tf = tf.convert_to_tensor(
+                    current_state[None, :], dtype=tf.float32
+                )
                 dist = self.main_network(state_tf, training=False)
                 q_values = self.get_q_values_from_distribution(dist).numpy()[0]
                 action_id = np.argmax(q_values)
 
+            # Assign the chosen officer
             action_table[i] = action_id
+
+            # Build next_state right away
             next_state = np.concatenate([obs, action_table])
             done = 1 if i == (num_tasks - 1) else 0
 
-            episode_memory.append((current_state, action_id, 0.0, next_state, done))
+            # Compute partial makespan with the new assignment
+            partial_assignment.append(action_id)
+            new_makespan = self.env.partial_step(partial_assignment)
+            # The incremental reward is the change in makespan (if it goes up, negative reward,
+            # if it stays the same, zero, etc.). For example:
+            incremental_reward = -(new_makespan - old_makespan) / self.max_time
 
-        # Use the old reward logic
-        final_reward = -np.max(self.env.step(action_table.reshape(self.events.num_event, self.events.num_task)))
+            # Update old_makespan
+            old_makespan = new_makespan
 
-        # Update all rewards in episode_memory with the final reward
-        for i in range(len(episode_memory)):
-            s, a, _, ns, done = episode_memory[i]
-            episode_memory[i] = (s, a, final_reward, ns, done)
-
-        # Store in the main memory buffer
-        for (s, a, r, ns, done) in episode_memory:
-            self.memory.add_experience(
-                state=s,
-                action=a,
-                reward=r,
-                next_state=ns,
-                terminal=done,
-                priority=1.0
+            # Store it in the n-step buffer
+            self.nstep_buffer.store(
+                state=current_state,
+                action=action_id,
+                reward=incremental_reward,
+                next_state=next_state,
+                done=bool(done),
             )
 
+            # Try to pop from the buffer for training
+            if self.nstep_buffer.is_ready():
+                s0, a0, R, ns_n, done_n = self.nstep_buffer.pop()
+                self.memory.add_experience(
+                    state=s0,
+                    action=a0,
+                    reward=R,
+                    next_state=ns_n,
+                    terminal=int(done_n),
+                    priority=1.0,
+                )
+                self.train()
+
+        final_time = self.env.step(
+            action_table.reshape(self.events.num_event, self.events.num_task)
+        )
+        final_reward = -np.max(final_time) / self.max_time
+
+        # Now flush out the remaining transitions in the n-step buffer
+        while self.nstep_buffer.is_ready():
+            s0, a0, R, ns_n, done_n = self.nstep_buffer.pop()
+            # Mix in the final reward
+            R += final_reward
+            self.memory.add_experience(
+                state=s0,
+                action=a0,
+                reward=R,
+                next_state=ns_n,
+                terminal=int(done_n),
+                priority=1.0,
+            )
+            self.train()
+
+        self.nstep_buffer.clear()
+
+        # Decay epsilon
         self.epsilon = max(self.epsilon_min, self.epsilon * self.eps_decay)
         return final_reward
 
     def run_episode(self):
         state = self.env.reset()
-        self.max_time = np.max(np.array(self.officers.capability)) * self.events.num_task * self.events.num_event + \
-                        np.max(np.array(self.events.transition_matrix)) * self.events.num_task * self.events.num_event
+        self.max_time = (
+            np.max(np.array(self.officers.capability))
+            * self.events.num_task
+            * self.events.num_event
+            + np.max(np.array(self.events.transition_matrix))
+            * self.events.num_task
+            * self.events.num_event
+        )
         episode_reward = self.play_one_episode_step_by_step(state)
         self.train()
         return episode_reward
@@ -504,8 +574,9 @@ class RainbowDQN:
         if self.memory.size < self.memory.start_learning:
             return
 
-        states, actions, rewards, next_states, terminals, indices, weights = self.memory.sample(self.batch_size,
-                                                                                                beta=self.beta)
+        states, actions, rewards, next_states, terminals, indices, weights = (
+            self.memory.sample(self.batch_size, beta=self.beta)
+        )
         self.beta = min(1.0, self.beta + self.beta_increment)
 
         states_tf = tf.convert_to_tensor(states, dtype=tf.float32)
@@ -524,12 +595,12 @@ class RainbowDQN:
             dist_next_target = self.target_network(next_states_tf, training=False)
             batch_indices = tf.range(self.batch_size, dtype=tf.int64)
             dist_target_chosen = tf.gather_nd(
-                dist_next_target,
-                tf.stack([batch_indices, next_best_action], axis=1)
+                dist_next_target, tf.stack([batch_indices, next_best_action], axis=1)
             )
 
-            Tz = tf.expand_dims(rewards_tf, 1) + self.gamma * tf.expand_dims((1 - terminals_tf), 1) * tf.reshape(
-                self.atoms, (1, self.num_atoms))
+            Tz = tf.expand_dims(rewards_tf, 1) + self.gamma * tf.expand_dims(
+                (1 - terminals_tf), 1
+            ) * tf.reshape(self.atoms, (1, self.num_atoms))
             Tz = tf.clip_by_value(Tz, self.v_min, self.v_max)
             b = (Tz - self.v_min) / ((self.v_max - self.v_min) / (self.num_atoms - 1))
             l = tf.cast(tf.floor(b), tf.int64)
@@ -541,8 +612,8 @@ class RainbowDQN:
                 uj = u[:, j]
                 pj = dist_target_chosen[:, j]
 
-                w_u = (b[:, j] - tf.cast(lj, tf.float32))
-                w_l = (tf.cast(uj, tf.float32) - b[:, j])
+                w_u = b[:, j] - tf.cast(lj, tf.float32)
+                w_l = tf.cast(uj, tf.float32) - b[:, j]
 
                 indices_l = tf.stack([batch_indices, tf.cast(lj, tf.int64)], axis=1)
                 updates_l = pj * w_l
@@ -554,9 +625,12 @@ class RainbowDQN:
 
             dist_current_chosen = tf.gather_nd(
                 dist_current,
-                tf.stack([batch_indices, tf.cast(actions_tf, tf.int64)], axis=1)
+                tf.stack([batch_indices, tf.cast(actions_tf, tf.int64)], axis=1),
             )
-
+            # Normalize the distribution
+            proj_dist = proj_dist / tf.reduce_sum(proj_dist, axis=1, keepdims=True)
+            # proj_dist = tf.clip_by_value(proj_dist, 1e-8, 1.0)
+            # proj_dist = proj_dist / tf.reduce_sum(proj_dist, axis=1, keepdims=True)
             cross_entropy = -tf.reduce_sum(
                 proj_dist * tf.math.log(dist_current_chosen + 1e-8), axis=1
             )
@@ -564,7 +638,9 @@ class RainbowDQN:
 
         grads = tape.gradient(loss, self.main_network.trainable_variables)
         grads = [tf.clip_by_norm(g, 10.0) for g in grads]
-        self.main_network.optimizer.apply_gradients(zip(grads, self.main_network.trainable_variables))
+        self.main_network.optimizer.apply_gradients(
+            zip(grads, self.main_network.trainable_variables)
+        )
 
         td_errors = cross_entropy
         new_priorities = td_errors.numpy() + 1e-6
@@ -576,35 +652,45 @@ class RainbowDQN:
         if self.train_step_count % self.update_target_interval == 0:
             self.update_target()
 
-    def train_for_episodes(self, num_episodes=1000):
+    def train_for_episodes(self, num_episodes):
         rewards = []
+        epsilons = []
+        losses = []
         for ep in range(num_episodes):
             ep_reward = self.run_episode()
             self.env.reset()
             rewards.append(ep_reward)
+            epsilons.append(self.epsilon)
+            losses.append(self.losses)
 
             if ep % 10 == 0:
                 avg_reward = np.mean(rewards[-50:])
-                print(f"Episode {ep}, Reward: {ep_reward:.2f}, Avg: {avg_reward:.2f}, Eps: {self.epsilon:.2f}")
-        return rewards
+                avg_epsilon = np.mean(epsilons[-50:])
+                avg_losses = np.mean(losses[-50:])
+                print(
+                    f"Episode {ep}, Reward: {ep_reward:.4f}, Avg: {avg_reward:.4f}, Eps: {avg_epsilon:.2f}, Loss: {avg_losses:.4f}"
+                )
+        return rewards, epsilons, avg_losses
 
 
 if __name__ == "__main__":
-    NUM_OFFICERS = 4
-    NUM_EVENTS = 3
-    NUM_TASKS = 3
-    EPISODES = 10000
+    NUM_OFFICERS = 3
+    NUM_EVENTS = 2
+    NUM_TASKS = 2
+    EPISODES = 50000
 
-    env = Environment(Officers(NUM_OFFICERS, NUM_EVENTS, NUM_TASKS), Events(NUM_EVENTS, NUM_TASKS))
+    env = Environment(
+        Officers(NUM_OFFICERS, NUM_EVENTS, NUM_TASKS), Events(NUM_EVENTS, NUM_TASKS)
+    )
     rainbow_agent = RainbowDQN(
         officers=env.officers,
         events=env.events,
         gamma=0.99,
-        lr=5e-5,
+        lr=1e-5,
         num_atoms=51,
-        v_min=-110,
-        v_max=-50,
-        n_step=3,
+        v_min=-0.5,
+        v_max=0,
+        n_step=5,
         alpha=0.6,
         beta_start=0.4,
         beta_frames=100000,
@@ -613,14 +699,20 @@ if __name__ == "__main__":
         epsilon_min=0.1,
         update_target_interval=1000,
         use_dueling=True,
-        n_qubits = 16,
-        n_layers_q = 3
+        n_qubits=16,
+        n_layers_q=3,
     )
 
-    results = rainbow_agent.train_for_episodes(num_episodes=EPISODES)
+    results, epsilons, losses = rainbow_agent.train_for_episodes(num_episodes=EPISODES)
     # Average reward per 1000 episodes
-    avg_rewards = [np.mean(results[i:i + 1000]) for i in range(0, len(results), 1000)]
+    avg_rewards = [np.mean(results[i : i + 1000]) for i in range(0, len(results), 1000)]
+    avg_epsilons = [
+        np.mean(epsilons[i : i + 1000]) for i in range(0, len(epsilons), 1000)
+    ]
+    avg_losses = [np.mean(losses[i : i + 1000]) for i in range(0, len(losses), 1000)]
     print("Average reward per 1000 episodes:", avg_rewards)
+    print("Average epsilon per 1000 episodes:", avg_epsilons)
+    print("Average loss per 1000 episodes:", avg_losses)
     print("Training complete!")
     print("Final returns:", results[-10:])
     print("Average Return of Last 100 Episodes:", np.mean(results[-100:]))
