@@ -4,7 +4,7 @@
 [![arXiv](https://img.shields.io/badge/arXiv-2512.05946-b31b1b)](https://arxiv.org/abs/2512.05946)
 [![TensorFlow Quantum](https://img.shields.io/badge/TensorFlow%20Quantum-Cirq-orange)](https://www.tensorflow.org/quantum)
 
-VQR-DQN is a **hybrid quantum–classical deep reinforcement learning** framework that integrates **ring-topology variational quantum circuits (VQCs)** into the **Rainbow DQN** pipeline to solve the **Human Resource Allocation Problem (HRAP)**.
+VQR-DQN is a hybrid quantum–classical deep reinforcement learning framework that integrates ring-topology variational quantum circuits (VQCs) into the Rainbow DQN pipeline to solve the Human Resource Allocation Problem (HRAP).
 
 This repository accompanies the paper published in the *Quantum Software Engineering Practices (QSE)* track of **The 41st ACM/SIGAPP Symposium on Applied Computing (SAC '26)**, Thessaloniki, Greece.
 
